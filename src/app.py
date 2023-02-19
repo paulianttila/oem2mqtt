@@ -1,0 +1,240 @@
+from mqtt_framework import Framework
+from mqtt_framework import Config
+from mqtt_framework.callbacks import Callbacks
+from mqtt_framework.app import TriggerSource
+
+from prometheus_client import Counter
+
+from datetime import datetime
+import threading
+import socket
+import struct
+import binascii
+from cacheout import Cache
+
+class MyConfig(Config):
+
+    def __init__(self):
+        super().__init__(self.APP_NAME)
+
+    APP_NAME = 'oem2mqtt'
+
+    # App specific variables
+
+    UDP_PORT = 9999
+    CACHE_TIME = 300
+    MSG_THROTTLE_TIME = 5
+    INCLUDE_NODE_ID_TO_TOPIC = True
+
+class MyApp:
+
+    def init(self, callbacks: Callbacks) -> None:
+        self.logger = callbacks.get_logger()
+        self.config = callbacks.get_config()
+        self.metrics_registry = callbacks.get_metrics_registry()
+        self.add_url_rule = callbacks.add_url_rule
+        self.publish_value_to_mqtt_topic = callbacks.publish_value_to_mqtt_topic
+        self.subscribe_to_mqtt_topic = callbacks.subscribe_to_mqtt_topic
+        self.received_messages_metric = Counter('received_messages', '', registry=self.metrics_registry)
+        self.received_messages_errors_metric = Counter('received_messages_errors', '', registry=self.metrics_registry)
+        self.exit = False        
+        self.udp_receiver = None
+        self.messageCache = Cache(maxsize=256, ttl=self.config['MSG_THROTTLE_TIME'])
+        self.valueCache = Cache(maxsize=256, ttl=self.config['CACHE_TIME'])
+        self.parserRuleCache = {}
+        self.parserVarNamesCache = {}
+        self.parserVarScalersCache = {}
+        self.include_node_id_to_topic = False
+        if self.config['INCLUDE_NODE_ID_TO_TOPIC'].lower() == "true":
+            self.include_node_id_to_topic = True
+
+
+    def get_version(self) -> str:
+        return '1.0.0'
+
+    def stop(self) -> None:
+        self.logger.debug('Stopping...')
+        self.exit = True
+        if self.udp_receiver:
+            self.udp_receiver.stop()
+            if self.udp_receiver.is_alive():
+                self.udp_receiver.join()
+        self.logger.debug('Exit')
+
+
+    def subscribe_to_mqtt_topics(self) -> None:
+        pass
+
+    def mqtt_message_received(self, topic: str, message: str) -> None:
+        pass
+
+    def do_healthy_check(self) -> bool:
+        return self.udp_receiver.is_alive()
+
+    # Do work
+    def do_update(self, trigger_source: TriggerSource) -> None:
+        self.logger.debug('update called, trigger_source=%s', trigger_source)
+        if trigger_source == trigger_source.MANUAL:
+            self.valueCache.clear()
+
+        if self.udp_receiver is None:
+            self.logger.info('Start UDP receiver')
+            self.udp_receiver = threading.Thread(target=self.start_udp_receiver, daemon=True)
+            self.udp_receiver.start()
+
+    def start_udp_receiver(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(('0.0.0.0', self.config['UDP_PORT']))
+        self.logger.debug('Waiting data from UDP port %d', self.config['UDP_PORT'])
+
+        while not self.exit:
+            try:
+                data, addr = sock.recvfrom(1024) # buffer size is 1024 bytes
+                self.received_messages_metric.inc()
+
+                if not data: 
+                    self.logger.debug('No data')
+                    continue
+                self.handle_data(data)
+            except Exception as e:
+                self.received_messages_errors_metric.inc()
+                self.logger.error('Error occured: %s' % e)
+                self.logger.debug('Error occured: %s' % e, exc_info=True)
+
+        self.logger.debug('UDP receiver stopped')
+
+    def handle_data(self, data):
+        data = data.decode('ascii')
+        #self.logger.debug('Received data (type=%s): %s', type(data), data)
+        
+        # Remove CR,LF
+        if data.endswith("\n") or data.endswith("\r"): data = data[:-1]
+        if data.endswith("\n") or data.endswith("\r"): data = data[:-1]
+
+        self.logger.debug('Received data: %s', data)
+
+        # Split string into values
+        data = data.split(' ')
+
+        nodeid = int(data[0])
+        previousMsg = self.messageCache.get(nodeid, None)
+
+        if previousMsg is None:
+            data = data[1:]
+            d = [int(i) for i in data]
+            d = bytearray(d)
+
+            unpackStr = self.get_parser_rule(nodeid)
+            if unpackStr is not None:
+                self.logger.debug('unpackStr=%s, msg len=%s, msg type=%s, data=%s', 
+                    unpackStr, len(d), type(d), binascii.hexlify(d).upper())
+
+                values = struct.unpack(unpackStr, d)
+                names = self.get_parser_variable_names(nodeid)
+                scalers = self.get_parser_variable_scalers(nodeid)
+                if len(values) == len(names) == len(scalers):
+                    #self.logger.debug('result={0}'.format(values))
+                    #self.logger.debug('Names: %s' % names)
+                    #self.logger.debug('Scalers: %s' % scalers)
+                
+                    for i, v in enumerate(values):
+                        self.logger.debug('%s : %s (%s:%s)', names[i], self.scale_value(v, scalers[i]), v, scalers[i])
+                        if names[i] != '':
+                            self.publish_value(nodeid, names[i], self.scale_value(v, scalers[i]))
+                        else:
+                            self.logger.debug('Skip message publishing as name is empty: %s', names[i])
+        
+                    self.messageCache.set(nodeid, data)
+                else:
+                    self.logger.debug('Array lenghts does not match: len(values)=%d, len(names)=%d, len(scalers)=%d',
+                        len(values), len(names), len(scalers))
+            else:
+                self.logger.debug('Skip message parsing, unpack string not defined for nodeid: %s', nodeid)
+        else:
+            self.logger.debug('Skip message parsing for node id: %s', nodeid)
+
+    def publish_value(self, nodeid, key, value):
+        previousvalue = self.valueCache.get(key)
+        publish=False
+        if previousvalue is None:
+            self.logger.debug('%s: no cache value available', key)
+            publish=True
+        else:
+            if value == previousvalue:
+                self.logger.debug('%s = %s : skip update because of same value', key, value)
+            else:
+                publish=True
+        
+        if publish:
+            self.logger.info('%s = %s', key, value)
+            if self.include_node_id_to_topic:
+                topic = 'node{0}/{1}'.format(nodeid, key)
+            else:
+                topic = key
+            self.publish_value_to_mqtt_topic(
+                topic,
+                value,
+                False)
+            self.valueCache.set(key, value)
+
+    def get_parser_rule(self, nodeid):
+        unpackStr = self.parserRuleCache.get(nodeid)
+        if unpackStr is not None:
+            self.logger.debug('unpackStr from cache=%s', unpackStr)
+            return unpackStr
+        else:
+            unpackStr = self.config['MSG_PARSER_RULE_NODE_' + str(nodeid)]
+            if unpackStr is not None:
+                unpackStr = unpackStr.replace(' ', '')
+                unpackStr = unpackStr.replace(',', '')
+                unpackStr = '<' + unpackStr
+                self.logger.debug('Generated unpackStr=%s', unpackStr)
+                self.parserRuleCache[nodeid] = unpackStr
+                return unpackStr
+            else:
+                return None
+
+    def get_parser_variable_names(self, nodeid):
+        names = self.parserVarNamesCache.get(nodeid)
+        if names is not None:
+            self.logger.debug('names from cache=%s', names)
+            return names
+        else:
+            names = self.config['MSG_PARSER_VAR_NAMES_NODE_' + str(nodeid)]
+            if names is not None:
+                names = names.replace(' ', '')
+                names = names.split(',')
+                self.logger.debug('Generated names=%s', names)
+                self.parserVarNamesCache[nodeid] = names
+                return names
+            else:
+                return None
+
+    def get_parser_variable_scalers(self, nodeid):
+        scalers = self.parserVarScalersCache.get(nodeid)
+        if scalers is not None:
+            self.logger.debug('Scaler from cache=%s', scalers)
+            return scalers
+        else:
+            scalers = self.config['MSG_PARSER_VAR_SCALERS_NODE_' + str(nodeid)]
+            if scalers is not None:
+                scalers = scalers.replace(' ', '')
+                scalers = scalers.split(',')
+                self.logger.debug('Generated scalers=%s', scalers)
+                self.parserVarScalersCache[nodeid] = scalers
+                return scalers
+            else:
+                return None
+
+    def scale_value(self, value, scale):
+        if not scale == "1":
+            val = value * float(scale)
+            if val % 1 == 0:
+                return int(val)
+            else:
+                return round(float(val), 2)
+        else:
+            return value
+                
+if __name__ == '__main__':
+    Framework().start(MyApp(), MyConfig(), blocked=True)
