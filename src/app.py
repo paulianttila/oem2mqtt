@@ -5,13 +5,12 @@ from mqtt_framework.app import TriggerSource
 
 from prometheus_client import Counter
 
-from datetime import datetime
 import threading
 import socket
 import struct
 import binascii
 from cacheout import Cache
-
+from typing import Any
 
 class MyConfig(Config):
     def __init__(self):
@@ -86,7 +85,7 @@ class MyApp:
             )
             self.udp_receiver.start()
 
-    def start_udp_receiver(self):
+    def start_udp_receiver(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind(("0.0.0.0", self.config["UDP_PORT"]))
         self.logger.debug("Waiting data from UDP port %d", self.config["UDP_PORT"])
@@ -102,21 +101,16 @@ class MyApp:
                 self.handle_data(data)
             except Exception as e:
                 self.received_messages_errors_metric.inc()
-                self.logger.error("Error occured: %s" % e)
-                self.logger.debug("Error occured: %s" % e, exc_info=True)
+                self.logger.error(f"Error occured: {e}")
+                self.logger.debug(f"Error occured: {e}", exc_info=True)
 
         self.logger.debug("UDP receiver stopped")
 
-    def handle_data(self, data):
+    def handle_data(self, data: bytes) -> None:
         data = data.decode("ascii")
         # self.logger.debug('Received data (type=%s): %s', type(data), data)
 
-        # Remove CR,LF
-        if data.endswith("\n") or data.endswith("\r"):
-            data = data[:-1]
-        if data.endswith("\n") or data.endswith("\r"):
-            data = data[:-1]
-
+        data = self.remove_line_breaks(data)
         self.logger.debug("Received data: %s", data)
 
         # Split string into values
@@ -125,75 +119,93 @@ class MyApp:
         nodeid = int(data[0])
         previousMsg = self.messageCache.get(nodeid, None)
 
-        if previousMsg is None:
-            data = data[1:]
-            d = [int(i) for i in data]
-            d = bytearray(d)
+        if previousMsg is not None:
+            self.logger.debug("Skip message parsing for node id: %s", nodeid)
+            return
 
-            unpackStr = self.get_parser_rule(nodeid)
-            if unpackStr is not None:
-                self.logger.debug(
-                    "unpackStr=%s, msg len=%s, msg type=%s, data=%s",
-                    unpackStr,
-                    len(d),
-                    type(d),
-                    binascii.hexlify(d).upper(),
+        values = self.parse_values(nodeid, data)
+        names = self.get_parser_variable_names(nodeid)
+        scalers = self.get_parser_variable_scalers(nodeid)
+        if not len(values) == len(names) == len(scalers):
+           self.logger.debug(
+                "Array lenghts does not match: len(values)=%d"
+                ", len(names)=%d, len(scalers)=%d",
+                len(values),
+                len(names),
+                len(scalers),
+            )
+           return
+
+        # self.logger.debug('result={0}'.format(values))
+        # self.logger.debug('Names: %s' % names)
+        # self.logger.debug('Scalers: %s' % scalers)
+
+        for i, val in enumerate(values):
+            self.logger.debug(
+                "%s : %s (%s:%s)",
+                names[i],
+                self.scale_value(val, scalers[i]),
+                val,
+                scalers[i],
+            )
+            if names[i] != "":
+                self.publish_value(
+                    nodeid, names[i], self.scale_value(val, scalers[i])
                 )
-
-                values = struct.unpack(unpackStr, d)
-                names = self.get_parser_variable_names(nodeid)
-                scalers = self.get_parser_variable_scalers(nodeid)
-                if len(values) == len(names) == len(scalers):
-                    # self.logger.debug('result={0}'.format(values))
-                    # self.logger.debug('Names: %s' % names)
-                    # self.logger.debug('Scalers: %s' % scalers)
-
-                    for i, v in enumerate(values):
-                        self.logger.debug(
-                            "%s : %s (%s:%s)",
-                            names[i],
-                            self.scale_value(v, scalers[i]),
-                            v,
-                            scalers[i],
-                        )
-                        if names[i] != "":
-                            self.publish_value(
-                                nodeid, names[i], self.scale_value(v, scalers[i])
-                            )
-                        else:
-                            self.logger.debug(
-                                "Skip message publishing as name is empty: %s", names[i]
-                            )
-
-                    self.messageCache.set(nodeid, data)
-                else:
-                    self.logger.debug(
-                        "Array lenghts does not match: len(values)=%d, len(names)=%d, len(scalers)=%d",
-                        len(values),
-                        len(names),
-                        len(scalers),
-                    )
             else:
                 self.logger.debug(
-                    "Skip message parsing, unpack string not defined for nodeid: %s",
-                    nodeid,
+                    "Skip message publishing as name is empty: %s", names[i]
                 )
-        else:
-            self.logger.debug("Skip message parsing for node id: %s", nodeid)
 
-    def publish_value(self, nodeid, key, value):
-        previousvalue = self.valueCache.get(key)
+        self.messageCache.set(nodeid, data)
+ 
+    def remove_line_breaks(self, data: bytes) -> bytes:
+        # Remove CR,LF
+        if data.endswith("\n") or data.endswith("\r"):
+            data = data[:-1]
+        if data.endswith("\n") or data.endswith("\r"):
+            data = data[:-1]
+        return data
+
+    def parse_values(self, nodeid: int, data: bytes) -> tuple[Any, ...]:
+        data = data[1:]
+        vals = [int(i) for i in data]
+        vals = bytearray(vals)
+
+        unpackStr = self.get_parser_rule(nodeid)
+        if unpackStr is None:
+            self.logger.debug(
+                "Skip message parsing, unpack string not defined for nodeid: %s",
+                nodeid,
+            )
+            return ()
+
+        self.logger.debug(
+            "unpackStr=%s, msg len=%s, msg type=%s, data=%s",
+            unpackStr,
+            len(vals),
+            type(vals),
+            binascii.hexlify(vals).upper(),
+        )
+
+        return struct.unpack(unpackStr, vals)
+
+    def scale_value(self, value, scale: float) -> int | float:
+        if scale == 1:
+            return value
+        val = value * scale
+        return int(val) if val % 1 == 0 else round(float(val), 2)
+
+    def publish_value(self, nodeid: int, key: str, value: str) -> None:
+        prevVal = self.valueCache.get(key)
         publish = False
-        if previousvalue is None:
+        if prevVal is None:
             self.logger.debug("%s: no cache value available", key)
             publish = True
+        elif value == prevVal:
+            self.logger.debug("%s = %s : skip update because of same value", key, value)
         else:
-            if value == previousvalue:
-                self.logger.debug(
-                    "%s = %s : skip update because of same value", key, value
-                )
-            else:
-                publish = True
+            publish = True
 
         if publish:
             self.logger.info("%s = %s", key, value)
@@ -204,65 +216,50 @@ class MyApp:
             self.publish_value_to_mqtt_topic(topic, value, False)
             self.valueCache.set(key, value)
 
-    def get_parser_rule(self, nodeid):
-        unpackStr = self.parserRuleCache.get(nodeid)
-        if unpackStr is not None:
-            self.logger.debug("unpackStr from cache=%s", unpackStr)
-            return unpackStr
+    def get_parser_rule(self, nodeid: int) -> None | str:
+        unpack = self.parserRuleCache.get(nodeid)
+        if unpack is not None:
+            self.logger.debug("unpackStr from cache=%s", unpack)
+            return unpack
         else:
-            unpackStr = self.config["MSG_PARSER_RULE_NODE_" + str(nodeid)]
-            if unpackStr is not None:
-                unpackStr = unpackStr.replace(" ", "")
-                unpackStr = unpackStr.replace(",", "")
-                unpackStr = "<" + unpackStr
-                self.logger.debug("Generated unpackStr=%s", unpackStr)
-                self.parserRuleCache[nodeid] = unpackStr
-                return unpackStr
-            else:
-                return None
+            unpack = self.config[f"MSG_PARSER_RULE_NODE_{nodeid}"]
+            return None if unpack is None else self.parse_unpack_str(unpack, nodeid)
 
-    def get_parser_variable_names(self, nodeid):
+    def parse_unpack_str(self, unpackStr: str, nodeid: int) -> str:
+        unpackStr = unpackStr.replace(" ", "")
+        unpackStr = unpackStr.replace(",", "")
+        unpackStr = f"<{unpackStr}"
+        self.logger.debug("Generated unpackStr=%s", unpackStr)
+        self.parserRuleCache[nodeid] = unpackStr
+        return unpackStr
+
+    def get_parser_variable_names(self, nodeid: int) -> None | list[str]:
         names = self.parserVarNamesCache.get(nodeid)
         if names is not None:
             self.logger.debug("names from cache=%s", names)
-            return names
         else:
-            names = self.config["MSG_PARSER_VAR_NAMES_NODE_" + str(nodeid)]
-            if names is not None:
-                names = names.replace(" ", "")
-                names = names.split(",")
-                self.logger.debug("Generated names=%s", names)
-                self.parserVarNamesCache[nodeid] = names
-                return names
-            else:
+            names = self.config[f"MSG_PARSER_VAR_NAMES_NODE_{nodeid}"]
+            if names is None:
                 return None
+            names = names.replace(" ", "")
+            names = names.split(",")
+            self.logger.debug("Generated names=%s", names)
+            self.parserVarNamesCache[nodeid] = names
+        return names
 
-    def get_parser_variable_scalers(self, nodeid):
+    def get_parser_variable_scalers(self, nodeid: int) -> None | list[float]:
         scalers = self.parserVarScalersCache.get(nodeid)
         if scalers is not None:
-            self.logger.debug("Scaler from cache=%s", scalers)
-            return scalers
+            self.logger.debug("Scalers from cache=%s", scalers)
         else:
-            scalers = self.config["MSG_PARSER_VAR_SCALERS_NODE_" + str(nodeid)]
-            if scalers is not None:
-                scalers = scalers.replace(" ", "")
-                scalers = scalers.split(",")
-                self.logger.debug("Generated scalers=%s", scalers)
-                self.parserVarScalersCache[nodeid] = scalers
-                return scalers
-            else:
+            scalers = self.config[f"MSG_PARSER_VAR_SCALERS_NODE_{nodeid}"]
+            if scalers is None:
                 return None
-
-    def scale_value(self, value, scale):
-        if not scale == "1":
-            val = value * float(scale)
-            if val % 1 == 0:
-                return int(val)
-            else:
-                return round(float(val), 2)
-        else:
-            return value
-
+            s = scalers.replace(" ", "").split(",")
+            scalers = [float(i) for i in s]
+            self.logger.debug("Generated scalers=%s", scalers)
+            self.parserVarScalersCache[nodeid] = scalers
+        return scalers
 
 if __name__ == "__main__":
     Framework().start(MyApp(), MyConfig(), blocked=True)
