@@ -12,6 +12,7 @@ import binascii
 from cacheout import Cache
 from typing import Any
 
+
 class MyConfig(Config):
     def __init__(self):
         super().__init__(self.APP_NAME)
@@ -87,7 +88,7 @@ class MyApp:
 
     def start_udp_receiver(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("0.0.0.0", self.config["UDP_PORT"]))
+        sock.bind(("0.0.0.0", self.config["UDP_PORT"]))  # nosec
         self.logger.debug("Waiting data from UDP port %d", self.config["UDP_PORT"])
 
         while not self.exit:
@@ -127,14 +128,14 @@ class MyApp:
         names = self.get_parser_variable_names(nodeid)
         scalers = self.get_parser_variable_scalers(nodeid)
         if not len(values) == len(names) == len(scalers):
-           self.logger.debug(
+            self.logger.debug(
                 "Array lenghts does not match: len(values)=%d"
                 ", len(names)=%d, len(scalers)=%d",
                 len(values),
                 len(names),
                 len(scalers),
             )
-           return
+            return
 
         # self.logger.debug('result={0}'.format(values))
         # self.logger.debug('Names: %s' % names)
@@ -149,16 +150,14 @@ class MyApp:
                 scalers[i],
             )
             if names[i] != "":
-                self.publish_value(
-                    nodeid, names[i], self.scale_value(val, scalers[i])
-                )
+                self.publish_value(nodeid, names[i], self.scale_value(val, scalers[i]))
             else:
                 self.logger.debug(
                     "Skip message publishing as name is empty: %s", names[i]
                 )
 
         self.messageCache.set(nodeid, data)
- 
+
     def remove_line_breaks(self, data: bytes) -> bytes:
         # Remove CR,LF
         if data.endswith("\n") or data.endswith("\r"):
@@ -260,6 +259,7 @@ class MyApp:
             self.logger.debug("Generated scalers=%s", scalers)
             self.parserVarScalersCache[nodeid] = scalers
         return scalers
+
 
 if __name__ == "__main__":
     Framework().start(MyApp(), MyConfig(), blocked=True)
