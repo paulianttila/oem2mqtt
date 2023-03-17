@@ -68,7 +68,7 @@ more-itertools==9.0.0
     # via
     #   cheroot
     #   jaraco-functools
-mqtt-framework @ git+https://github.com/paulianttila/MQTT-Framework.git@v1.0.2
+mqtt-framework @ git+https://github.com/paulianttila/MQTT-Framework.git@v1.1.1
     # via -r requirements-dev.in
 mypy-extensions==1.0.0
     # via black

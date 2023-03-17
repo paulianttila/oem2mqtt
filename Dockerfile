@@ -1,4 +1,4 @@
-FROM paulianttila/mqtt-framework:1.0.2
+FROM paulianttila/mqtt-framework:1.1.1
 
 ARG DIR=/app
 ARG APP=app.py
